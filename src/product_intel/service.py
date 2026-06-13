@@ -11,13 +11,17 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from . import purchases as purchases_mod
 from .alerts.notifier import Notifier
 from .alerts.rules import RuleParams, evaluate
 from .clients.base import ClientNotConfigured
 from .config import Config
 from .container import build_clients
 from .db import Store
+from .effective_price import OffersBook, compute_effective_price
+from .market import MarketScanner
 from .models import Alert, Availability, PriceObservation, Product, TrackedProduct
+from .reviews.synthesis import ReviewSynthesizer
 from .workers.constraints import Constraints, violations
 from .workers.discovery import DiscoveryWorker
 from .workers.price_context import PriceContextWorker
@@ -35,6 +39,21 @@ class Service:
         self._normalizer = clients.normalizer
         self.notifier = Notifier(self.config)
         self.rule_params = RuleParams()
+        # Phase B: manual offer book (missing file -> empty book, sticker stands)
+        self.offers = OffersBook.load(self.config.offers_file)
+        # Phase C: review synthesis pipeline
+        self.synthesizer = ReviewSynthesizer(
+            clients.review_sources, clients.llm, clients.embedder, store=self.store
+        )
+        self._web_search = clients.web_search
+        # Phase D: Layer 3 market scanner
+        from .market import ScanParams
+
+        self.market = MarketScanner(
+            self.store,
+            clients.web_search,
+            ScanParams(search_interval_seconds=self.config.market_scan_interval_seconds),
+        )
 
     def close(self) -> None:
         self.store.close()
@@ -128,6 +147,7 @@ class Service:
         url: str,
         target_price: float,
         rye_product_id: Optional[str] = None,
+        category: Optional[str] = None,
     ) -> dict[str, Any]:
         tracked = TrackedProduct(
             label=label,
@@ -135,6 +155,7 @@ class Service:
             url=url,
             target_price_subunits=_to_subunits(target_price) or 0,
             rye_product_id=rye_product_id,
+            category=category,
         )
         tid = self.store.add_tracked(tracked)
         # Seed an initial observation so cold-start history begins immediately.
@@ -205,6 +226,11 @@ class Service:
 
         fired = []
         for a in alerts:
+            # Section 4: alert payloads include the effective-price computation.
+            ep = compute_effective_price(self.offers, t.merchant, a.price_subunits)
+            a.payload["effective_price"] = ep.to_dict()
+            if ep.components:
+                a.message += f" — {ep.summary()}"
             a.delivered = self.notifier.send(a)
             self.store.add_alert(a)
             fired.append(_alert_dict(a))
@@ -228,6 +254,88 @@ class Service:
                 log.exception("check_once failed for %s", t.id)
                 results.append({"tracked_id": t.id, "error": str(e)})
         return results
+
+    def sweep(self) -> dict[str, Any]:
+        """Full monitor pass: Layer 1/2 price checks, then Layer 3 market
+        context, then post-purchase (price-protection / return-window) checks."""
+        price_results = self.check_all_active()
+        layer3 = self._deliver(self.market.scan())
+        purchase_alerts = self._deliver(purchases_mod.check_purchases(self.store))
+        return {
+            "price_checks": price_results,
+            "layer3_alerts": layer3,
+            "purchase_alerts": purchase_alerts,
+        }
+
+    def _deliver(self, alerts: list[Alert]) -> list[dict[str, Any]]:
+        out = []
+        for a in alerts:
+            a.delivered = self.notifier.send(a)
+            # Purchases without a tracked link carry tracked_product_id == -1;
+            # they are delivered and dedup'd via market_events but cannot be
+            # persisted against the alerts FK.
+            if a.tracked_product_id > 0:
+                self.store.add_alert(a)
+            out.append(_alert_dict(a))
+        return out
+
+    # -- Phase B: effective price -----------------------------------------
+    def effective_price(self, merchant: str, price: float) -> dict[str, Any]:
+        ep = compute_effective_price(self.offers, merchant, _to_subunits(price) or 0)
+        return ep.to_dict()
+
+    def reload_offers(self) -> dict[str, Any]:
+        """Re-read the manual offer YAML (refreshed weekly by hand)."""
+        self.offers = OffersBook.load(self.config.offers_file)
+        return {
+            "source": self.offers.source or str(self.config.offers_file),
+            "portals": len(self.offers.portals),
+            "card_offers": len(self.offers.card_offers),
+            "earn_rates": len(self.offers.earn_rates),
+        }
+
+    # -- Phase 5: post-purchase --------------------------------------------
+    def record_purchase(
+        self,
+        label: str,
+        merchant: str,
+        price: float,
+        url: Optional[str] = None,
+        tracked_id: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return purchases_mod.record_purchase(
+            self.store,
+            label=label,
+            merchant=merchant,
+            price_subunits=_to_subunits(price) or 0,
+            url=url,
+            tracked_product_id=tracked_id,
+        )
+
+    def purchase_status(self) -> dict[str, Any]:
+        return {"purchases": purchases_mod.purchase_status(self.store)}
+
+    def mark_warranty_registered(self, purchase_id: int) -> dict[str, Any]:
+        self.store.update_purchase(purchase_id, warranty_registered=True)
+        return {"purchase_id": purchase_id, "warranty_registered": True}
+
+    # -- Phase C: review synthesis ------------------------------------------
+    def synthesize_reviews(
+        self,
+        query: str,
+        product_label: Optional[str] = None,
+        user_profile: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return self.synthesizer.synthesize(query, product_label, user_profile)
+
+    def list_contradictions(
+        self, product_label: Optional[str] = None, open_only: bool = False
+    ) -> dict[str, Any]:
+        return {"contradictions": self.store.contradictions(product_label, open_only)}
+
+    # -- Phase D: market scan -----------------------------------------------
+    def market_scan(self, force: bool = False) -> dict[str, Any]:
+        return {"alerts": self._deliver(self.market.scan(force=force))}
 
     # -- handoff ---------------------------------------------------------
     def stage_handoff(self, tracked_id: int, constraints: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -260,6 +368,8 @@ class Service:
             current_subunits=product.price_subunits,
         )
         meets_target = product.price_subunits <= t.target_price_subunits and product.price_subunits > 0
+        ep = compute_effective_price(self.offers, t.merchant, product.price_subunits)
+        policy = purchases_mod.policy_for(t.merchant)
         return {
             "executor": "manual_deeplink",  # acp_checkout is a future per-retailer capability flag
             "tracked_id": tracked_id,
@@ -272,10 +382,34 @@ class Service:
                 "meets_target": meets_target,
                 "availability": product.availability.value,
                 "price_context": ctx.summary(),
+                "effective_price": ep.to_dict(),
+                "codes_to_try": self._coupon_codes(t.merchant),
+                "price_protection": (
+                    f"none ({policy.protection_note})"
+                    if policy.price_protection_days == 0
+                    else policy.protection_note
+                    if policy.price_protection_days is None
+                    else f"{policy.price_protection_days} days — {policy.protection_note}"
+                ),
                 "constraint_violations": constraint_violations,
                 "note": "Open the deep link and complete checkout manually. "
-                "Agent does not touch the retailer's logged-in session.",
+                "Agent does not touch the retailer's logged-in session. "
+                "Record the purchase with record_purchase to start post-purchase tracking.",
             },
+        }
+
+    def _coupon_codes(self, merchant: str) -> dict[str, Any]:
+        """Best-effort coupon pass (Section 4): a web search at handoff time,
+        surfaced as 'codes to try' — never auto-applied; no aggregator API exists."""
+        if self._web_search is None:
+            return {"codes": [], "note": "no web-search backend configured"}
+        try:
+            hits = self._web_search.search(f"{merchant} coupon code", limit=3)
+        except (ClientNotConfigured, Exception):  # noqa: BLE001
+            return {"codes": [], "note": "coupon search unavailable"}
+        return {
+            "codes": [{"title": h["title"], "url": h["url"]} for h in hits],
+            "note": "best-effort web results — verify manually at checkout",
         }
 
     # -- internals -------------------------------------------------------

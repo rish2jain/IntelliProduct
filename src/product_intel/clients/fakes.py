@@ -75,6 +75,30 @@ class FakeNormalizationClient(NormalizationClient):
         )
 
 
+class FakeWebSearchClient:
+    """Deterministic Layer 3 search hits for offline runs and tests."""
+
+    def search(self, query: str, limit: int = 5) -> list[dict]:
+        q = query.lower()
+        if "successor" in q and "sony" in q:
+            return [
+                {
+                    "title": "Sony a7 V announcement rumored for fall",
+                    "url": "https://example.com/sony-a7v-rumor",
+                    "snippet": "successor to the a7 IV expected; current-gen discounts likely",
+                }
+            ][:limit]
+        if "firmware" in q:
+            return [
+                {
+                    "title": "Sony firmware 3.0 addresses battery drain",
+                    "url": "https://example.com/sony-fw-3-0",
+                    "snippet": "firmware fix for the battery drain reported by long-term owners",
+                }
+            ][:limit]
+        return []
+
+
 class FakePriceHistoryClient(PriceHistoryClient):
     """Returns synthetic Amazon history; non-Amazon -> unavailable."""
 

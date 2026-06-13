@@ -1,0 +1,52 @@
+# Manual offer book for the effective-price layer (Section 4).
+#
+# Refresh weekly by hand — this is honest and sufficient. Amex/Chase Offers
+# have no API, and scraping a logged-in card portal is the same legal posture
+# as scraping Amazon. Copy to ~/.product-intel/offers.yaml (or set OFFERS_FILE).
+
+# Your cents-per-point valuations (used to value miles/points portals + earn).
+point_values:
+  AA: 1.6      # AAdvantage
+  UR: 2.05     # Chase Ultimate Rewards
+  MR: 2.0      # Amex Membership Rewards
+  C1: 1.8      # Capital One
+
+# Shopping portals: kind=cash -> rate is %, kind=miles -> rate is miles per $.
+portals:
+  - portal: Rakuten
+    merchant: "B&H"
+    rate: 4.0
+    kind: cash
+  - portal: AAdvantage eShopping
+    merchant: Dell
+    rate: 6
+    kind: miles
+    currency: AA
+    note: boosted through 6/30
+
+# Card-linked offers (Amex Offers / Chase Offers class). Fixed rebates.
+card_offers:
+  - card: Amex Plat
+    merchant: "B&H"
+    discount: 64.00
+    min_spend: 600.00
+    expires: 2026-06-30
+  - card: Chase Sapphire Reserve
+    merchant: Dell
+    discount: 60.00
+    min_spend: 300.00
+    expires: 2026-07-15
+
+# Category multipliers: best earn per merchant ("*" = catch-all card).
+# Informational — reported alongside the effective price, not subtracted.
+earn_rates:
+  - card: Venture X
+    merchant: "*"
+    rate: 2
+    kind: points
+    currency: C1
+  - card: Amex Plat
+    merchant: Dell
+    rate: 1
+    kind: points
+    currency: MR

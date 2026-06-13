@@ -42,9 +42,28 @@ class Config:
     # Monitor loop
     monitor_interval_seconds: int
 
+    # Phase B: effective-price layer — manual offer YAML, refreshed weekly
+    offers_file: Path
+
+    # Phase C: review synthesis — local inference (Ollama on the Mac Studio)
+    ollama_base_url: str
+    ollama_model: str
+    ollama_embed_model: str
+    # Review sources (each optional; absence -> source skipped with a coverage note)
+    reddit_client_id: str | None
+    reddit_client_secret: str | None
+    reddit_user_agent: str
+    youtube_api_key: str | None
+    bestbuy_api_key: str | None
+
+    # Phase D: Layer 3 market context
+    brave_api_key: str | None
+    market_scan_interval_seconds: int
+
     @classmethod
     def from_env(cls) -> "Config":
         db_path = Path(os.environ.get("PRODUCT_INTEL_DB", str(_default_db_path())))
+        home = db_path.parent
         return cls(
             db_path=db_path,
             channel3_api_key=os.environ.get("CHANNEL3_API_KEY"),
@@ -58,4 +77,17 @@ class Config:
             pushover_token=os.environ.get("PUSHOVER_TOKEN"),
             pushover_user=os.environ.get("PUSHOVER_USER"),
             monitor_interval_seconds=int(os.environ.get("MONITOR_INTERVAL_SECONDS", "21600")),
+            offers_file=Path(os.environ.get("OFFERS_FILE", str(home / "offers.yaml"))),
+            ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+            ollama_model=os.environ.get("OLLAMA_MODEL", "qwen3:30b"),
+            ollama_embed_model=os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+            reddit_client_id=os.environ.get("REDDIT_CLIENT_ID"),
+            reddit_client_secret=os.environ.get("REDDIT_CLIENT_SECRET"),
+            reddit_user_agent=os.environ.get("REDDIT_USER_AGENT", "product-intel/0.2"),
+            youtube_api_key=os.environ.get("YOUTUBE_API_KEY"),
+            bestbuy_api_key=os.environ.get("BESTBUY_API_KEY"),
+            brave_api_key=os.environ.get("BRAVE_API_KEY"),
+            market_scan_interval_seconds=int(
+                os.environ.get("MARKET_SCAN_INTERVAL_SECONDS", "604800")  # weekly
+            ),
         )

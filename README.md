@@ -1,29 +1,41 @@
 # IntelliProduct — Integrated Product Intelligence Agent
 
-Phase A of the [v2 design](docs/ipiav2design.md): a `product-intel` MCP server
-plus an always-on monitor that tracks product prices in SQLite and pushes
-**Layer 1 / Layer 2** alerts to your phone.
+Full implementation of the [v2 design](docs/ipiav2design.md): a `product-intel`
+MCP server plus an always-on monitor, covering all four build phases —
 
-This phase ships the monitoring value for the next real purchase. Effective-price
-routing (Phase B), use-case review synthesis (Phase C), and Layer 3 market-context
-triggers (Phase D) are scoped but not built — see the design doc's build order.
+- **Phase A — monitoring core:** discovery (Channel3 → Rye), Keepa price
+  context, SQLite tracking, launchd monitor with Layer 1/2 alerts.
+- **Phase B — effective price:** the portal / card-offer / earn stack from a
+  manual weekly YAML; alerts and handoffs report effective price, not sticker.
+- **Phase C — review synthesis:** use-case-segmented review synthesis over
+  defensible sources (expert sites, Best Buy API, Reddit, YouTube — never
+  Amazon scraping), with a persistent contradiction ledger.
+- **Phase D — Layer 3 market context:** discontinuation signals, competitor
+  price moves, weekly successor-announcement search, and firmware/recall
+  checks against open contradiction records.
+- **Phase 5 — post-purchase:** per-retailer price-protection policy table
+  (2026 reality: Amazon none, Best Buy members, Target 14d, Costco 30d,
+  B&H/Adorama case-by-case), return windows, warranty reminders.
 
-## What's here
+## Layout
 
-| Piece | Module | Notes |
-|---|---|---|
-| MCP server (FastMCP) | `product_intel.server` | 9 tools; `synthesize_reviews` is a Phase-C stub |
-| Discovery + Spec Worker | `product_intel.workers.discovery` | Channel3 search → Rye normalize |
-| Price Context Worker | `product_intel.workers.price_context` | Keepa for Amazon; honest "no history" otherwise |
-| Constraint post-filter | `product_intel.workers.constraints` | pure function, not an LLM "worker" (§2.1) |
-| Layer 1/2 alert rules | `product_intel.alerts.rules` | threshold + relative-value, with cold-start baselines |
-| SQLite state | `product_intel.db` | observations accrue over months (§2.3) |
-| Monitor daemon | `product_intel.monitor` | `launchd`-friendly `--once` sweep |
-| Notifier | `product_intel.alerts.notifier` | ntfy / Pushover |
+| Piece | Module |
+|---|---|
+| MCP server (FastMCP, 16 tools) | `product_intel.server` |
+| Discovery + Spec Worker | `product_intel.workers.discovery` |
+| Price Context Worker (Keepa, swappable) | `product_intel.workers.price_context` |
+| Constraint post-filter (pure function) | `product_intel.workers.constraints` |
+| Layer 1/2 alert rules | `product_intel.alerts.rules` |
+| Effective-price stack (Phase B) | `product_intel.effective_price` |
+| Post-purchase policies (Phase 5) | `product_intel.purchases` |
+| Review synthesis pipeline (Phase C) | `product_intel.reviews.*` |
+| Layer 3 market scanner (Phase D) | `product_intel.market` |
+| SQLite state | `product_intel.db` |
+| Monitor daemon | `product_intel.monitor` |
 
-Every external dependency (Channel3, Rye, Keepa) sits behind a `Protocol`, so the
-Keepa price-history source is swappable and the whole stack runs offline with
-in-memory fakes.
+Every external dependency — Channel3, Rye, Keepa, Brave Search, Ollama,
+Reddit, YouTube, Best Buy — sits behind a `Protocol` with an in-memory fake,
+so the entire stack runs offline.
 
 ## Quick start (offline, no API keys)
 
@@ -32,43 +44,56 @@ pip install -e .
 PRODUCT_INTEL_FAKE=1 python -m product_intel.demo
 ```
 
-The demo discovers candidates, starts tracking, simulates a price drop, fires a
-Layer 1 alert, and stages a purchase handoff.
+The demo walks all phases: discovery → tracking → a Layer 1 alert carrying the
+effective-price stack → review synthesis that opens a battery contradiction in
+the ledger → a Layer 3 scan that finds a successor signal *and* a firmware fix
+for that open contradiction → handoff briefing → purchase recording.
 
-## Run the tests
+## Tests
 
 ```bash
 pip install -e ".[dev]"
-pytest                 # 23 tests, fully offline
+pytest                 # 54 tests, fully offline
 ```
 
-## Run the MCP server
+## MCP server
 
 ```bash
 product-intel          # stdio; or: python -m product_intel.server
 ```
 
-Register it with Claude Code (`.mcp.json` / `claude mcp add`). Tools:
-`clarify_intent`, `build_candidate_pool`, `compare_candidates`,
-`get_price_context`, `start_tracking`, `stop_tracking`, `tracking_status`,
-`stage_handoff`, `synthesize_reviews`.
+Tools: `clarify_intent`, `build_candidate_pool`, `compare_candidates`,
+`get_price_context`, `synthesize_reviews`, `effective_price`, `reload_offers`,
+`start_tracking`, `stop_tracking`, `tracking_status`, `stage_handoff`,
+`record_purchase`, `purchase_status`, `mark_warranty_registered`,
+`list_contradictions`, `run_market_scan`.
 
-## Run the monitor
+## Monitor
 
 ```bash
-# single sweep of all active tracked products (launchd owns the schedule)
-python -m product_intel.monitor --once
-
-# or an in-process loop
-python -m product_intel.monitor
+python -m product_intel.monitor --once   # one sweep (launchd-friendly)
+python -m product_intel.monitor          # in-process loop
 ```
 
-On the always-on Mac Studio, install the launchd agent:
+Each sweep runs Layer 1/2 price checks, the Layer 3 market scan (the
+web-search pass honors a weekly cadence), and post-purchase checks. Install on
+the always-on Mac Studio:
 
 ```bash
 cp deploy/com.productintel.monitor.plist ~/Library/LaunchAgents/   # edit paths first
 launchctl load ~/Library/LaunchAgents/com.productintel.monitor.plist
 ```
+
+## The offer YAML (Phase B)
+
+Copy `deploy/offers.example.yaml` to `~/.product-intel/offers.yaml` and refresh
+weekly by hand — Amex/Chase Offers have no API, and scraping a logged-in card
+portal is the same legal posture as scraping Amazon. The alert then reads like
+the design doc's example:
+
+> `Sony a7 IV: $2,279.00 (target $2,300.00) at B&H — effective ~$2,123.84
+> after Rakuten 4% ($91.16), Amex Plat offer ($64.00, expires 2026-06-30)
+> on $2,279.00; pay with Venture X (+$45.58 earn)`
 
 ## Configuration
 
@@ -76,21 +101,30 @@ All via environment variables (no secrets in code):
 
 | Var | Purpose |
 |---|---|
-| `PRODUCT_INTEL_FAKE=1` | use in-memory fakes (offline) |
+| `PRODUCT_INTEL_FAKE=1` | in-memory fakes everywhere (offline) |
 | `PRODUCT_INTEL_DB` | SQLite path (default `~/.product-intel/product-intel.sqlite3`) |
-| `CHANNEL3_API_KEY` | discovery search |
-| `RYE_API_KEY` | URL → normalized product (also the live-price source for the monitor) |
-| `KEEPA_API_KEY` | Amazon price history (subscribe only during active tracking windows) |
-| `NTFY_TOPIC` / `PUSHOVER_TOKEN`+`PUSHOVER_USER` | phone alerts |
-| `MONITOR_INTERVAL_SECONDS` | loop interval (default 21600 = 6h) |
+| `OFFERS_FILE` | offer YAML path (default `~/.product-intel/offers.yaml`) |
+| `CHANNEL3_API_KEY` / `RYE_API_KEY` / `KEEPA_API_KEY` | discovery / normalization / Amazon history |
+| `OLLAMA_BASE_URL` / `OLLAMA_MODEL` / `OLLAMA_EMBED_MODEL` | local review processing (Mac Studio) |
+| `REDDIT_CLIENT_ID`+`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`, `BESTBUY_API_KEY` | review sources (each optional) |
+| `BRAVE_API_KEY` | Layer 3 web-search pass + handoff coupon search |
+| `NTFY_TOPIC` or `PUSHOVER_TOKEN`+`PUSHOVER_USER` | phone alerts |
+| `MONITOR_INTERVAL_SECONDS` / `MARKET_SCAN_INTERVAL_SECONDS` | sweep (6h) / web pass (weekly) cadence |
 
-## Design boundaries honored in this phase
+## Design boundaries honored
 
-- **No logged-in retailer session access.** The monitor and `stage_handoff` read
-  live prices via the Rye data API, never by scraping a logged-in cart — the
-  posture that lost in *Amazon v. Perplexity* (§1.1). Handoff produces a deep
-  link + briefing; the human checks out manually.
-- **No fabricated price history.** Non-Amazon retailers get an explicit
-  "no history available" flag; Layer 2 cold-starts its own baseline (§5).
-- **Swappable Keepa.** Behind `PriceHistoryClient`, so it can be subscribed and
-  cancelled per the design doc's cost note (§4).
+- **No logged-in retailer session access.** Live prices come from the Rye data
+  API; reviews come from official APIs and standard fetching; handoff emits a
+  deep link + briefing and the human checks out (§1.1, post-*Amazon v.
+  Perplexity*). Amazon review sentiment is reported as *unverifiable*, never
+  scraped.
+- **No fabricated data.** Non-Amazon price history cold-starts honestly;
+  review coverage gaps are listed per source; the no-policy retailer gets one
+  notice and zero false-hope protection alerts (§5).
+- **Compute placement (§2.2).** Bulk per-review extraction targets local
+  Ollama (with a deterministic heuristic fallback); the MCP tools return
+  structured output so the cross-candidate reasoning happens in the Claude
+  conversation under the existing subscription.
+- **Manual where automation is a rabbit hole (§4).** Offers live in a small
+  YAML refreshed weekly; coupon codes are best-effort "codes to try," never
+  auto-applied.

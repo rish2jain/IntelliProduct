@@ -13,6 +13,7 @@ authors = [{ name = "rish2jain" }]
 dependencies = [
     "httpx>=0.27",
     "fastmcp>=2.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

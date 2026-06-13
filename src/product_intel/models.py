@@ -86,6 +86,9 @@ class TrackedProduct:
     currency: str = "USD"
     rye_product_id: Optional[str] = None
     active: bool = True
+    # Category groups tracked products for Layer 3 competitor-move detection
+    # (e.g. two tracked camera bodies in "cameras" watch each other's drops).
+    category: Optional[str] = None
     id: Optional[int] = None
     created_at: float = field(default_factory=now_ts)
     # Cached last price each layer alerted at, for crossing/dedup logic.

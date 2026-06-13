@@ -72,6 +72,82 @@ def test_price_context_amazon_vs_non_amazon(service):
     assert "no history" in (bh["history_note"] or "").lower()
 
 
+def test_handoff_includes_effective_price_and_policy(service):
+    from product_intel.effective_price import OffersBook
+
+    service.offers = OffersBook.from_dict(
+        {
+            "portals": [{"portal": "Rakuten", "merchant": "B&H", "rate": 4.0, "kind": "cash"}],
+        }
+    )
+    t = service.start_tracking(
+        label="cam",
+        merchant="B&H",
+        url="https://www.bhphotovideo.com/c/product/sony-a7-iv-body",
+        target_price=2300.0,
+    )
+    b = service.stage_handoff(t["tracked_id"])["briefing"]
+    ep = b["effective_price"]
+    assert ep["effective"] < ep["sticker"]
+    assert any(c["kind"] == "portal" for c in ep["components"])
+    assert "case-by-case" in b["price_protection"]  # B&H policy
+    assert "codes" in b["codes_to_try"]
+
+
+def test_alert_payload_carries_effective_price(service):
+    from product_intel.effective_price import OffersBook
+
+    service.offers = OffersBook.from_dict(
+        {"portals": [{"portal": "Rakuten", "merchant": "B&H", "rate": 4.0, "kind": "cash"}]}
+    )
+    t = service.start_tracking(
+        label="cam",
+        merchant="B&H",
+        url="https://www.bhphotovideo.com/c/product/sony-a7-iv-body",
+        target_price=2400.0,  # seed obs at 2398 fires Layer 1
+    )
+    alerts = service.store.alerts_for(t["tracked_id"])
+    assert alerts and "effective_price" in alerts[0].payload
+    assert "effective ~$" in alerts[0].message
+
+
+def test_synthesize_reviews_through_service(service):
+    out = service.synthesize_reviews(
+        "Sony a7 IV", user_profile="parent shooting indoor volleyball weekly"
+    )
+    assert out["matched_segment"] is not None
+    assert out["review_base"]["amazon"] == 0
+    # contradiction landed in the shared store
+    assert service.list_contradictions(open_only=True)["contradictions"]
+
+
+def test_sweep_runs_all_layers(service):
+    service.start_tracking(
+        label="Sony a7 IV (body)",
+        merchant="B&H",
+        url="https://www.bhphotovideo.com/c/product/sony-a7-iv-body",
+        target_price=1000.0,
+        category="ff-camera",
+    )
+    out = service.sweep()
+    assert set(out) == {"price_checks", "layer3_alerts", "purchase_alerts"}
+    # First sweep triggers the (fake) successor search pass for the Sony label.
+    rules = [a["rule"] for a in out["layer3_alerts"]]
+    assert "successor_signal" in rules
+
+
+def test_purchase_flow_through_service(service):
+    t = service.start_tracking(
+        label="tv", merchant="Costco", url="https://www.costco.com/x", target_price=1.0
+    )
+    res = service.record_purchase("tv", "Costco", 1500.0, tracked_id=t["tracked_id"])
+    assert "30 days" in res["price_protection"]
+    st = service.purchase_status()["purchases"][0]
+    assert st["protection_days_left"] > 0
+    service.mark_warranty_registered(res["purchase_id"])
+    assert service.purchase_status()["purchases"][0]["warranty_registered"] is True
+
+
 def test_handoff_never_touches_session(service):
     t = service.start_tracking(
         label="cam",

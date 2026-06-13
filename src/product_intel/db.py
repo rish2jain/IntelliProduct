@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS tracked_products (
     target_price_subunits INTEGER NOT NULL,
     currency TEXT NOT NULL DEFAULT 'USD',
     active INTEGER NOT NULL DEFAULT 1,
+    category TEXT,
     last_alert_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -89,6 +90,55 @@ CREATE TABLE IF NOT EXISTS alerts (
     payload_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_alert_tracked ON alerts(tracked_product_id, created_at);
+
+-- Phase C: contradiction ledger (Section 3). Persisted records, not transient
+-- evaluator flags; Layer 3 checks firmware/recall events against open ones.
+CREATE TABLE IF NOT EXISTS contradictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    product_label TEXT NOT NULL,
+    aspect TEXT NOT NULL,
+    claim_a TEXT NOT NULL,
+    source_a TEXT NOT NULL,
+    claim_b TEXT NOT NULL,
+    source_b TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    resolution_note TEXT
+);
+
+-- Section 5 / Phase 5: post-purchase tracking against the per-retailer
+-- price-protection policy table.
+CREATE TABLE IF NOT EXISTS purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    tracked_product_id INTEGER REFERENCES tracked_products(id),
+    label TEXT NOT NULL,
+    merchant TEXT NOT NULL,
+    url TEXT,
+    price_subunits INTEGER NOT NULL,
+    purchased_at REAL NOT NULL,
+    return_days INTEGER,
+    protection_days INTEGER,
+    protection_note TEXT,
+    warranty_registered INTEGER NOT NULL DEFAULT 0,
+    protection_notified INTEGER NOT NULL DEFAULT 0,
+    closed INTEGER NOT NULL DEFAULT 0
+);
+
+-- Phase D: dedup ledger for Layer 3 events (one alert per distinct event).
+CREATE TABLE IF NOT EXISTS market_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    event_key TEXT NOT NULL UNIQUE,
+    tracked_product_id INTEGER,
+    kind TEXT NOT NULL,
+    message TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -101,7 +151,15 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive migrations for DBs created before a column existed."""
+        try:
+            self.conn.execute("ALTER TABLE tracked_products ADD COLUMN category TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already present
 
     def close(self) -> None:
         self.conn.close()
@@ -184,8 +242,8 @@ class Store:
         cur = self.conn.execute(
             """INSERT INTO tracked_products
                (created_at, label, merchant, url, rye_product_id,
-                target_price_subunits, currency, active, last_alert_json)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                target_price_subunits, currency, active, category, last_alert_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 t.created_at,
                 t.label,
@@ -195,6 +253,7 @@ class Store:
                 t.target_price_subunits,
                 t.currency,
                 int(t.active),
+                t.category,
                 json.dumps(t.last_alert_price_subunits),
             ),
         )
@@ -289,6 +348,130 @@ class Store:
         self.conn.commit()
         return int(cur.lastrowid)
 
+    # ---- contradiction ledger (Phase C) --------------------------------
+    def add_contradiction(
+        self,
+        product_label: str,
+        aspect: str,
+        claim_a: str,
+        source_a: str,
+        claim_b: str,
+        source_b: str,
+    ) -> Optional[int]:
+        """Persist a contradiction; dedup on an open record for the same
+        (label, aspect). Returns the new id, or None if already open."""
+        from .models import now_ts
+
+        existing = self.conn.execute(
+            "SELECT id FROM contradictions WHERE product_label = ? AND aspect = ? "
+            "AND status = 'open'",
+            (product_label, aspect),
+        ).fetchone()
+        if existing:
+            return None
+        cur = self.conn.execute(
+            """INSERT INTO contradictions
+               (created_at, product_label, aspect, claim_a, source_a, claim_b, source_b)
+               VALUES (?,?,?,?,?,?,?)""",
+            (now_ts(), product_label, aspect, claim_a, source_a, claim_b, source_b),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def contradictions(self, product_label: Optional[str] = None, open_only: bool = False) -> list[dict[str, Any]]:
+        q = "SELECT * FROM contradictions WHERE 1=1"
+        args: list[Any] = []
+        if product_label:
+            q += " AND product_label = ?"
+            args.append(product_label)
+        if open_only:
+            q += " AND status = 'open'"
+        rows = self.conn.execute(q + " ORDER BY created_at", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_contradiction_status(self, cid: int, status: str, note: Optional[str] = None) -> None:
+        self.conn.execute(
+            "UPDATE contradictions SET status = ?, resolution_note = COALESCE(?, resolution_note) "
+            "WHERE id = ?",
+            (status, note, cid),
+        )
+        self.conn.commit()
+
+    # ---- purchases (Section 5 / Phase 5) -------------------------------
+    def add_purchase(self, fields: dict[str, Any]) -> int:
+        from .models import now_ts
+
+        cur = self.conn.execute(
+            """INSERT INTO purchases
+               (created_at, tracked_product_id, label, merchant, url,
+                price_subunits, purchased_at, return_days, protection_days,
+                protection_note, warranty_registered, protection_notified, closed)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+            (
+                now_ts(),
+                fields.get("tracked_product_id"),
+                fields["label"],
+                fields["merchant"],
+                fields.get("url"),
+                fields["price_subunits"],
+                fields["purchased_at"],
+                fields.get("return_days"),
+                fields.get("protection_days"),
+                fields.get("protection_note"),
+                int(fields.get("warranty_registered", False)),
+                int(fields.get("protection_notified", False)),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def purchases(self, open_only: bool = True) -> list[dict[str, Any]]:
+        q = "SELECT * FROM purchases"
+        if open_only:
+            q += " WHERE closed = 0"
+        rows = self.conn.execute(q + " ORDER BY purchased_at").fetchall()
+        return [dict(r) for r in rows]
+
+    def update_purchase(self, purchase_id: int, **fields: Any) -> None:
+        allowed = {"warranty_registered", "protection_notified", "closed"}
+        sets = ", ".join(f"{k} = ?" for k in fields if k in allowed)
+        if not sets:
+            return
+        vals = [int(v) if isinstance(v, bool) else v for k, v in fields.items() if k in allowed]
+        self.conn.execute(f"UPDATE purchases SET {sets} WHERE id = ?", (*vals, purchase_id))
+        self.conn.commit()
+
+    # ---- market events (Phase D dedup) ---------------------------------
+    def try_add_event(
+        self, event_key: str, kind: str, message: str, tracked_product_id: Optional[int] = None
+    ) -> bool:
+        """Insert an event; False if this exact event already fired."""
+        from .models import now_ts
+
+        try:
+            self.conn.execute(
+                "INSERT INTO market_events (created_at, event_key, tracked_product_id, kind, message) "
+                "VALUES (?,?,?,?,?)",
+                (now_ts(), event_key, tracked_product_id, kind, message),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        self.conn.commit()
+        return True
+
+    # ---- meta KV --------------------------------------------------------
+    def get_meta(self, key: str) -> Optional[str]:
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
     def alerts_for(self, tracked_id: int, limit: int = 20) -> list[Alert]:
         rows = self.conn.execute(
             "SELECT * FROM alerts WHERE tracked_product_id = ? "
@@ -326,6 +509,7 @@ def _row_to_tracked(r: sqlite3.Row) -> TrackedProduct:
         target_price_subunits=r["target_price_subunits"],
         currency=r["currency"],
         active=bool(r["active"]),
+        category=r["category"],
         last_alert_price_subunits=json.loads(r["last_alert_json"] or "{}"),
     )
 

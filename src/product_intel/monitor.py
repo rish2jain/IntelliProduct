@@ -23,12 +23,18 @@ log = logging.getLogger("product_intel.monitor")
 
 
 def run_once(service: Service) -> int:
-    results = service.check_all_active()
-    fired = sum(len(r.get("alerts_fired", [])) for r in results)
+    """One full sweep: Layer 1/2 price checks, Layer 3 market context (weekly
+    web pass honors its own cadence), and post-purchase checks."""
+    sweep = service.sweep()
+    results = sweep["price_checks"]
+    extra = sweep["layer3_alerts"] + sweep["purchase_alerts"]
+    fired = sum(len(r.get("alerts_fired", [])) for r in results) + len(extra)
     log.info("monitor sweep: %d products checked, %d alerts fired", len(results), fired)
     for r in results:
         for a in r.get("alerts_fired", []):
             log.info("ALERT [%s] %s", a["layer"], a["message"])
+    for a in extra:
+        log.info("ALERT [%s] %s", a["layer"], a["message"])
     return fired
 
 
