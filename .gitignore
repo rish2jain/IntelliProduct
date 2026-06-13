@@ -1,0 +1,15 @@
+# Build, test, and runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Local state (SQLite tracking DB, logs)
+*.sqlite3
+*.log
+.product-intel/
