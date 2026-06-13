@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job for the product-intel monitor (Section 2.3).
+
+  Install on the always-on Mac Studio:
+    1. Edit the paths below to your venv + repo.
+    2. cp deploy/com.productintel.monitor.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.productintel.monitor.plist
+
+  launchd owns the schedule via StartInterval; the job runs `--once` and exits,
+  so a crash never wedges the loop. 21600s = every 6 hours.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.productintel.monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/IntelliProduct/.venv/bin/python</string>
+        <string>-m</string>
+        <string>product_intel.monitor</string>
+        <string>--once</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PRODUCT_INTEL_HOME</key>
+        <string>/Users/YOU/.product-intel</string>
+        <!-- Add CHANNEL3_API_KEY / RYE_API_KEY / KEEPA_API_KEY / NTFY_TOPIC here,
+             or load them from a keychain wrapper script instead. -->
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.product-intel/monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.product-intel/monitor.err.log</string>
+</dict>
+</plist>
