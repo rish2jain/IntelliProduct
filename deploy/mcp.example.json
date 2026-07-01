@@ -1,0 +1,14 @@
+{
+  "//": "Example .mcp.json for registering product-intel with Claude Code.",
+  "//install": "pip install -e . in a venv, then adjust the command path below,",
+  "//or": "run: claude mcp add product-intel -- /path/to/.venv/bin/product-intel",
+  "mcpServers": {
+    "product-intel": {
+      "command": "/Users/YOU/IntelliProduct/.venv/bin/product-intel",
+      "env": {
+        "PRODUCT_INTEL_DB": "/Users/YOU/.product-intel/product-intel.sqlite3",
+        "OFFERS_FILE": "/Users/YOU/.product-intel/offers.yaml"
+      }
+    }
+  }
+}

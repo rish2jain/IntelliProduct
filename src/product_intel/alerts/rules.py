@@ -33,6 +33,10 @@ class RuleParams:
     # Layer 2 (cold start): alert when current is this fraction below the
     # trailing median of observed prices (e.g. 0.05 == 5% under median).
     cold_start_drop_fraction: float = 0.05
+    # Re-arm: once the price rises this fraction above a layer's last alerted
+    # price (Layer 1: above the target itself), that layer's dedup state
+    # clears and the next drop into the trigger region alerts again.
+    rearm_fraction: float = 0.03
 
 
 def evaluate(
@@ -53,6 +57,18 @@ def evaluate(
 
     current = observations[-1]
     price = current.price_subunits
+
+    # --- Re-arm ------------------------------------------------------------
+    # Dedup-by-improvement alone would eat mid-cycle events: alert at $2,279,
+    # rebound to $2,450 for two months, drop to $2,299 — no alert, because
+    # $2,299 doesn't beat $2,279. Exiting the trigger region resets the layer,
+    # so re-entering it is a new event. The caller must persist the returned
+    # dedup state even when no alerts fire.
+    if price > tracked.target_price_subunits:
+        last_alert.pop(AlertLayer.THRESHOLD.value, None)
+    l2_prev = last_alert.get(AlertLayer.RELATIVE_VALUE.value)
+    if l2_prev is not None and price >= l2_prev * (1 + params.rearm_fraction):
+        last_alert.pop(AlertLayer.RELATIVE_VALUE.value, None)
 
     # --- Layer 1: threshold ------------------------------------------------
     if price <= tracked.target_price_subunits:

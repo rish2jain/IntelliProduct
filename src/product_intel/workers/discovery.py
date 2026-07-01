@@ -9,7 +9,7 @@ Synthesis Worker; this Phase-A worker stops at normalized candidates.
 
 from __future__ import annotations
 
-from ..clients.base import ClientNotConfigured, DiscoveryClient, NormalizationClient
+from ..clients.base import DiscoveryClient, NormalizationClient
 from ..models import Product
 from .constraints import Constraints, filter_candidates
 
@@ -45,7 +45,7 @@ class DiscoveryWorker:
             return p
         try:
             normalized = self._normalizer.normalize(p.url)
-        except (ClientNotConfigured, Exception):  # noqa: BLE001 — best-effort
+        except Exception:  # noqa: BLE001 — normalization is best-effort enrichment
             return p
         # Preserve the Channel3 id; prefer Rye's normalized fields.
         if not normalized.channel3_id:

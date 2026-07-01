@@ -1,5 +1,9 @@
 # Backlog
 
+> **Update:** the v3 design-review pass ([docs/design-review-v3.md](docs/design-review-v3.md))
+> implemented several items from this list; they are marked `[x]` below with a
+> pointer. Live-API validation (P0) remains the top open lane.
+
 Remaining work after the all-phases implementation (PR #1). Every external
 dependency runs behind a `Protocol` with an in-memory fake, so the stack is
 complete and offline-testable — but most of the **real** integrations have
@@ -67,52 +71,54 @@ The pipeline is end-to-end but uses simplified components vs. the design doc's
       per product and does **not** yet enforce robots.txt despite the design
       doc's commitment. Add robots.txt checking and a small per-category URL
       registry (Rtings, DPReview-class).
-- [ ] **Contradiction resolution workflow.** `set_contradiction_status` exists
-      but no MCP tool exposes manual resolve/dismiss. Add `resolve_contradiction`
-      and surface open records in `tracking_status`.
+- [x] **Contradiction resolution workflow.** ~~`set_contradiction_status` exists
+      but no MCP tool exposes manual resolve/dismiss.~~ Done in v3 review pass:
+      `resolve_contradiction` tool + open counts in `tracking_status`.
 
 ## P1 — Effective price (Phase B) ergonomics
 
-- [ ] **Stale-offer warning.** The offers YAML is refreshed by hand; warn when
-      `reload_offers` sees a file older than ~8 days (it's meant to be weekly).
-- [ ] **YAML schema validation.** Bad keys/dates currently raise raw
-      exceptions on load; validate and report which entry is malformed.
-- [ ] **Per-merchant alias map.** "B&H" vs "B&H Photo" vs "bhphotovideo.com"
-      should resolve to one merchant key for offer matching.
+- [x] **Stale-offer warning.** Done in v3 review pass: `OffersBook.stale()`
+      (8-day contract) surfaced in `reload_offers`, `monitor_health`, and
+      handoff briefings.
+- [x] **YAML schema validation.** Done in v3 review pass: entry-level
+      `OffersError` naming each bad section/index; a bad file never zeroes the
+      active book or blocks daemon startup.
+- [x] **Per-merchant alias map.** Done in v3 review pass: `merchants.py`
+      canonicalization applied to offers, policy table, and executor registry.
 
 ## P1 — Monitor robustness
 
-- [ ] **Per-product intervals + jitter** so a large tracked set doesn't hammer
-      Rye/Keepa in one burst.
+- [ ] **Per-product intervals** so different price ranges can poll at different
+      cadences. (Loop-level ±10% jitter done in v3 review pass.)
 - [ ] **API rate-limit / quota handling** with cooldown (Keepa tokens, Channel3
       free tier, Brave quota).
 - [ ] **Keepa subscribe/cancel reminder.** The design doc subscribes Keepa only
       during active tracking windows of >$500 products. Emit a reminder to
       subscribe when such tracking starts and to cancel when none remain.
-- [ ] **Health/heartbeat.** A `meta` row + optional ntfy heartbeat so a silently
-      dead launchd job is noticed.
+- [x] **Health/heartbeat.** Done in v3 review pass: sweep heartbeat in `meta` +
+      `monitor_health` MCP tool with an overdue flag. (Push-based ntfy
+      heartbeat still open if wanted.)
 
 ---
 
 ## P2 — Protocol-native checkout (deferred by design, §1.2)
 
-- [ ] `stage_handoff` returns `executor: "manual_deeplink"` always. Add the
-      `acp_checkout` executor behind a **per-retailer capability flag**, checked
-      at handoff time — only where a merchant has opted into an agentic-commerce
-      protocol. Do not build assuming coverage (effectively zero for B&H/Adorama/
-      Best Buy today).
+- [x] **Dispatch seam** done in v3 review pass: `executors.py` capability
+      registry (`PRODUCT_INTEL_ACP_MERCHANTS` opt-in), checked at handoff time.
+- [ ] An actual `acp_checkout` implementation stays deferred until a relevant
+      merchant opts into a protocol — do not build assuming coverage.
 
 ## P2 — Packaging & ops
 
-- [ ] **`.mcp.json` example** + `claude mcp add` instructions for registering
-      the server with Claude Code.
-- [ ] **CI workflow** (GitHub Actions): run `pytest` on push; the SessionStart
-      hook skill can keep web sessions green.
+- [x] **`.mcp.json` example** done in v3 review pass (`deploy/mcp.example.json`).
+- [x] **CI workflow** done in v3 review pass (`.github/workflows/tests.yml`:
+      pytest + demo smoke test, fully offline).
 - [ ] **Secrets via keychain.** The launchd plist references a keychain wrapper
       that isn't provided — ship a small `security find-generic-password` shim so
       keys aren't plaintext in the plist `EnvironmentVariables`.
-- [ ] **Migrations.** `db._migrate` is a single additive `ALTER`; adopt a
-      versioned migration list before the schema changes again.
+- [x] **Migrations.** Done in v3 review pass: versioned `MIGRATIONS` map +
+      `schema_version` in `meta`; WAL + busy_timeout for the two-process
+      (MCP server + launchd monitor) shape.
 
 ## P2 — Intent clarifier
 

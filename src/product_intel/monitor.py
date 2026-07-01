@@ -39,13 +39,17 @@ def run_once(service: Service) -> int:
 
 
 def run_loop(service: Service, interval: int) -> None:
-    log.info("monitor loop started; interval=%ss", interval)
+    import random
+
+    log.info("monitor loop started; interval=%ss (±10%% jitter)", interval)
     while True:
         try:
             run_once(service)
         except Exception:  # noqa: BLE001 — never let a sweep crash the daemon
             log.exception("monitor sweep failed")
-        time.sleep(interval)
+        # Jitter so a large tracked set doesn't hit providers in lockstep
+        # bursts at fixed wall-clock times.
+        time.sleep(interval * random.uniform(0.9, 1.1))
 
 
 def main() -> None:

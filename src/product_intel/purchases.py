@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from .db import Store
+from .merchants import canonical
 from .models import Alert, AlertLayer, now_ts
 
 DAY = 86400
@@ -40,7 +41,11 @@ DEFAULT_POLICY = RetailerPolicy(0, "no known price-protection policy", 30)
 
 
 def policy_for(merchant: str) -> RetailerPolicy:
-    m = merchant.strip().lower()
+    m = canonical(merchant)
+    if m in POLICIES:
+        return POLICIES[m]
+    # Substring fallback for qualified names the alias table doesn't know
+    # ("amazon uk", "best buy outlet").
     for key, pol in POLICIES.items():
         if key in m:
             return pol

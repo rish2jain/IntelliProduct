@@ -22,7 +22,6 @@ import statistics
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from .clients.base import ClientNotConfigured
 from .clients.websearch import WebSearchClient
 from .db import Store
 from .models import Alert, AlertLayer, Availability, TrackedProduct, now_ts
@@ -163,7 +162,7 @@ class MarketScanner:
     def _safe_search(self, query: str, limit: int) -> list[dict[str, Any]]:
         try:
             return self._search.search(query, limit=limit)  # type: ignore[union-attr]
-        except (ClientNotConfigured, Exception):  # noqa: BLE001 — search is best-effort
+        except Exception:  # noqa: BLE001 — the weekly pass degrades to nothing, never crashes
             return []
 
 

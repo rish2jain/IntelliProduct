@@ -21,7 +21,7 @@ MCP server plus an always-on monitor, covering all four build phases —
 
 | Piece | Module |
 |---|---|
-| MCP server (FastMCP, 16 tools) | `product_intel.server` |
+| MCP server (FastMCP, 18 tools) | `product_intel.server` |
 | Discovery + Spec Worker | `product_intel.workers.discovery` |
 | Price Context Worker (Keepa, swappable) | `product_intel.workers.price_context` |
 | Constraint post-filter (pure function) | `product_intel.workers.constraints` |
@@ -53,7 +53,7 @@ for that open contradiction → handoff briefing → purchase recording.
 
 ```bash
 pip install -e ".[dev]"
-pytest                 # 54 tests, fully offline
+pytest                 # 70 tests, fully offline
 ```
 
 ## MCP server
@@ -66,7 +66,13 @@ Tools: `clarify_intent`, `build_candidate_pool`, `compare_candidates`,
 `get_price_context`, `synthesize_reviews`, `effective_price`, `reload_offers`,
 `start_tracking`, `stop_tracking`, `tracking_status`, `stage_handoff`,
 `record_purchase`, `purchase_status`, `mark_warranty_registered`,
-`list_contradictions`, `run_market_scan`.
+`list_contradictions`, `resolve_contradiction`, `run_market_scan`,
+`monitor_health`.
+
+Design refinements adopted after implementation review are documented in
+[docs/design-review-v3.md](docs/design-review-v3.md) (alert re-arm, canonical
+merchants, offer validation/staleness, executor seam, WAL + versioned
+migrations, monitor heartbeat).
 
 ## Monitor
 

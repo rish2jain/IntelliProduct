@@ -11,8 +11,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from dataclasses import dataclass
+
 from . import purchases as purchases_mod
 from .alerts.notifier import Notifier
+from .executors import executor_for
 from .alerts.rules import RuleParams, evaluate
 from .clients.base import ClientNotConfigured
 from .config import Config
@@ -20,7 +23,7 @@ from .container import build_clients
 from .db import Store
 from .effective_price import OffersBook, compute_effective_price
 from .market import MarketScanner
-from .models import Alert, Availability, PriceObservation, Product, TrackedProduct
+from .models import Alert, Availability, PriceObservation, Product, TrackedProduct, now_ts
 from .reviews.synthesis import ReviewSynthesizer
 from .workers.constraints import Constraints, violations
 from .workers.discovery import DiscoveryWorker
@@ -39,8 +42,16 @@ class Service:
         self._normalizer = clients.normalizer
         self.notifier = Notifier(self.config)
         self.rule_params = RuleParams()
-        # Phase B: manual offer book (missing file -> empty book, sticker stands)
-        self.offers = OffersBook.load(self.config.offers_file)
+        # Phase B: manual offer book (missing file -> empty book, sticker
+        # stands; malformed file -> empty book + logged errors, so a bad edit
+        # never prevents the monitor from starting).
+        from .effective_price import OffersError
+
+        try:
+            self.offers = OffersBook.load(self.config.offers_file)
+        except OffersError as e:
+            log.error("offers file rejected, starting with empty book: %s", e)
+            self.offers = OffersBook(source=f"{self.config.offers_file} (rejected: invalid)")
         # Phase C: review synthesis pipeline
         self.synthesizer = ReviewSynthesizer(
             clients.review_sources, clients.llm, clients.embedder, store=self.store
@@ -181,11 +192,13 @@ class Service:
                     "tracked_id": t.id,
                     "label": t.label,
                     "merchant": t.merchant,
+                    "category": t.category,
                     "url": t.url,
                     "target_price": _from_subunits(t.target_price_subunits),
                     "active": t.active,
                     "latest_price": _from_subunits(latest.price_subunits) if latest else None,
                     "observations": len(obs),
+                    "open_contradictions": len(self.store.contradictions(t.label, open_only=True)),
                     "recent_alerts": [_alert_dict(a) for a in alerts],
                 }
             )
@@ -234,7 +247,9 @@ class Service:
             a.delivered = self.notifier.send(a)
             self.store.add_alert(a)
             fired.append(_alert_dict(a))
-        if alerts:
+        # Dedup state must persist even on alert-free sweeps: re-arm (a price
+        # rising out of the trigger region) mutates it without firing anything.
+        if last_alert != t.last_alert_price_subunits:
             self.store.update_last_alert(tracked_id, last_alert)
 
         return {
@@ -257,14 +272,37 @@ class Service:
 
     def sweep(self) -> dict[str, Any]:
         """Full monitor pass: Layer 1/2 price checks, then Layer 3 market
-        context, then post-purchase (price-protection / return-window) checks."""
+        context, then post-purchase (price-protection / return-window) checks.
+        Writes a heartbeat so a dead monitor is distinguishable from a quiet
+        market (see monitor_health)."""
         price_results = self.check_all_active()
         layer3 = self._deliver(self.market.scan())
         purchase_alerts = self._deliver(purchases_mod.check_purchases(self.store))
+        fired = sum(len(r.get("alerts_fired", [])) for r in price_results)
+        fired += len(layer3) + len(purchase_alerts)
+        self.store.set_meta("last_sweep", str(now_ts()))
+        self.store.set_meta("last_sweep_alerts", str(fired))
         return {
             "price_checks": price_results,
             "layer3_alerts": layer3,
             "purchase_alerts": purchase_alerts,
+        }
+
+    def monitor_health(self) -> dict[str, Any]:
+        """Heartbeat status: when the monitor last swept and whether it's overdue."""
+        last = self.store.get_meta("last_sweep")
+        interval = self.config.monitor_interval_seconds
+        age = (now_ts() - float(last)) if last else None
+        return {
+            "last_sweep_age_seconds": round(age) if age is not None else None,
+            "overdue": age is None or age > 2 * interval,
+            "monitor_interval_seconds": interval,
+            "last_sweep_alerts": int(self.store.get_meta("last_sweep_alerts") or 0),
+            "active_tracked": len(self.store.active_tracked()),
+            "notifier_configured": self.notifier.configured,
+            "offers_stale": self.offers.stale(),
+            "db_path": str(self.config.db_path),
+            "note": None if last else "monitor has never swept this database",
         }
 
     def _deliver(self, alerts: list[Alert]) -> list[dict[str, Any]]:
@@ -285,13 +323,23 @@ class Service:
         return ep.to_dict()
 
     def reload_offers(self) -> dict[str, Any]:
-        """Re-read the manual offer YAML (refreshed weekly by hand)."""
-        self.offers = OffersBook.load(self.config.offers_file)
+        """Re-read the manual offer YAML (refreshed weekly by hand).
+
+        A malformed file is reported entry-by-entry and the previous book
+        stays active, so a bad edit never silently zeroes the offer stack.
+        """
+        from .effective_price import OffersError
+
+        try:
+            self.offers = OffersBook.load(self.config.offers_file)
+        except OffersError as e:
+            return {"error": str(e), "kept": "previous offer book remains active"}
         return {
             "source": self.offers.source or str(self.config.offers_file),
             "portals": len(self.offers.portals),
             "card_offers": len(self.offers.card_offers),
             "earn_rates": len(self.offers.earn_rates),
+            "stale": self.offers.stale(),
         }
 
     # -- Phase 5: post-purchase --------------------------------------------
@@ -333,6 +381,16 @@ class Service:
     ) -> dict[str, Any]:
         return {"contradictions": self.store.contradictions(product_label, open_only)}
 
+    def resolve_contradiction(
+        self, contradiction_id: int, status: str = "resolved", note: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Close the loop on a ledger record after verifying (or dismissing) it."""
+        allowed = {"resolved", "dismissed", "update_reported", "open"}
+        if status not in allowed:
+            return {"error": f"status must be one of {sorted(allowed)}"}
+        self.store.set_contradiction_status(contradiction_id, status, note)
+        return {"contradiction_id": contradiction_id, "status": status, "note": note}
+
     # -- Phase D: market scan -----------------------------------------------
     def market_scan(self, force: bool = False) -> dict[str, Any]:
         return {"alerts": self._deliver(self.market.scan(force=force))}
@@ -371,7 +429,9 @@ class Service:
         ep = compute_effective_price(self.offers, t.merchant, product.price_subunits)
         policy = purchases_mod.policy_for(t.merchant)
         return {
-            "executor": "manual_deeplink",  # acp_checkout is a future per-retailer capability flag
+            # Per-retailer capability flag, checked at handoff time (§1.2):
+            # manual_deeplink unless the merchant is in the protocol registry.
+            "executor": executor_for(t.merchant),
             "tracked_id": tracked_id,
             "deep_link": t.url,
             "briefing": {
@@ -392,6 +452,12 @@ class Service:
                     else f"{policy.price_protection_days} days — {policy.protection_note}"
                 ),
                 "constraint_violations": constraint_violations,
+                "offers_stale": (
+                    "offers YAML is older than the weekly refresh contract — "
+                    "portal rates and card offers may be out of date"
+                    if self.offers.stale()
+                    else None
+                ),
                 "note": "Open the deep link and complete checkout manually. "
                 "Agent does not touch the retailer's logged-in session. "
                 "Record the purchase with record_purchase to start post-purchase tracking.",
@@ -405,7 +471,7 @@ class Service:
             return {"codes": [], "note": "no web-search backend configured"}
         try:
             hits = self._web_search.search(f"{merchant} coupon code", limit=3)
-        except (ClientNotConfigured, Exception):  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — search is optional garnish on the handoff
             return {"codes": [], "note": "coupon search unavailable"}
         return {
             "codes": [{"title": h["title"], "url": h["url"]} for h in hits],
@@ -413,7 +479,7 @@ class Service:
         }
 
     # -- internals -------------------------------------------------------
-    def _live_price(self, t: TrackedProduct):
+    def _live_price(self, t: TrackedProduct) -> Optional["LivePrice"]:
         """Resolve a current price via the normalizer; None on failure."""
         try:
             p = self._normalizer.normalize(t.url)
@@ -424,14 +490,20 @@ class Service:
             return None
         if p.price_subunits <= 0:
             return None
+        return LivePrice(
+            price_subunits=p.price_subunits,
+            currency=p.currency,
+            availability=p.availability,
+            source="rye",
+        )
 
-        class _Live:
-            price_subunits = p.price_subunits
-            currency = p.currency
-            availability = p.availability
-            source = "rye"
 
-        return _Live()
+@dataclass(frozen=True)
+class LivePrice:
+    price_subunits: int
+    currency: str
+    availability: Availability
+    source: str
 
 
 # -- serialization helpers ----------------------------------------------

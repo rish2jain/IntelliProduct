@@ -170,6 +170,22 @@ def list_contradictions(product_label: str | None = None, open_only: bool = Fals
 
 
 @mcp.tool
+def resolve_contradiction(
+    contradiction_id: int, status: str = "resolved", note: str | None = None
+) -> dict[str, Any]:
+    """Close a contradiction-ledger record after verifying or dismissing it
+    (status: resolved | dismissed | update_reported | open)."""
+    return service().resolve_contradiction(contradiction_id, status, note)
+
+
+@mcp.tool
+def monitor_health() -> dict[str, Any]:
+    """Monitor heartbeat: last sweep age, overdue flag, tracked count,
+    notifier/offers status. Use to tell a dead launchd job from a quiet market."""
+    return service().monitor_health()
+
+
+@mcp.tool
 def run_market_scan(force: bool = False) -> dict[str, Any]:
     """Phase D: run the Layer 3 market-context scan now (discontinuation,
     competitor moves, successor announcements, firmware vs open contradictions).

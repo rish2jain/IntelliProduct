@@ -20,10 +20,17 @@ Amazon. All money math stays in integer subunits.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
+
+from .merchants import canonical
+
+
+class OffersError(ValueError):
+    """Raised on a malformed offers YAML, naming every bad entry."""
 
 
 @dataclass(frozen=True)
@@ -81,48 +88,78 @@ class EarnRate:
 
 @dataclass
 class OffersBook:
-    """The manual offer YAML, parsed. Empty book == sticker price stands."""
+    """The manual offer YAML, parsed and validated.
+
+    Empty book == sticker price stands. Merchant names are canonicalized at
+    load so YAML entries join against merchant strings from Channel3/Rye or
+    user input regardless of spelling ("B&H Photo" vs "B&H").
+    """
 
     point_values_cpp: dict[str, float] = field(default_factory=dict)
     portals: list[PortalOffer] = field(default_factory=list)
     card_offers: list[CardOffer] = field(default_factory=list)
     earn_rates: list[EarnRate] = field(default_factory=list)
     source: Optional[str] = None
+    file_mtime: Optional[float] = None
+
+    def stale(self, max_age_days: float = 8.0) -> bool:
+        """True when the YAML hasn't been refreshed within the weekly contract."""
+        if self.file_mtime is None:
+            return False
+        return (time.time() - self.file_mtime) > max_age_days * 86400
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], source: Optional[str] = None) -> "OffersBook":
-        portals = [
-            PortalOffer(
-                portal=p["portal"],
-                merchant=p["merchant"],
-                rate=float(p["rate"]),
-                kind=p.get("kind", "cash"),
-                currency=p.get("currency"),
-                note=p.get("note"),
+        errors: list[str] = []
+        portals: list[PortalOffer] = []
+        for i, p in enumerate(d.get("portals") or []):
+            try:
+                portals.append(
+                    PortalOffer(
+                        portal=_require(p, "portal"),
+                        merchant=canonical(_require(p, "merchant")),
+                        rate=float(_require(p, "rate")),
+                        kind=_one_of(p.get("kind", "cash"), {"cash", "miles"}, "kind"),
+                        currency=p.get("currency"),
+                        note=p.get("note"),
+                    )
+                )
+            except (KeyError, ValueError, TypeError) as e:
+                errors.append(f"portals[{i}]: {e}")
+        cards: list[CardOffer] = []
+        for i, c in enumerate(d.get("card_offers") or []):
+            try:
+                cards.append(
+                    CardOffer(
+                        card=_require(c, "card"),
+                        merchant=canonical(_require(c, "merchant")),
+                        discount_subunits=_subunits(_require(c, "discount")),
+                        min_spend_subunits=_subunits(c.get("min_spend", 0)),
+                        expires=_date(c.get("expires")),
+                        note=c.get("note"),
+                    )
+                )
+            except (KeyError, ValueError, TypeError) as e:
+                errors.append(f"card_offers[{i}]: {e}")
+        earns: list[EarnRate] = []
+        for i, e in enumerate(d.get("earn_rates") or []):
+            try:
+                merchant = e.get("merchant", "*")
+                earns.append(
+                    EarnRate(
+                        card=_require(e, "card"),
+                        merchant=merchant if merchant == "*" else canonical(merchant),
+                        rate=float(_require(e, "rate")),
+                        kind=_one_of(e.get("kind", "points"), {"points", "cash"}, "kind"),
+                        currency=e.get("currency"),
+                    )
+                )
+            except (KeyError, ValueError, TypeError) as err:
+                errors.append(f"earn_rates[{i}]: {err}")
+        if errors:
+            raise OffersError(
+                "offers YAML invalid:\n  " + "\n  ".join(errors)
             )
-            for p in d.get("portals", [])
-        ]
-        cards = [
-            CardOffer(
-                card=c["card"],
-                merchant=c["merchant"],
-                discount_subunits=_subunits(c["discount"]),
-                min_spend_subunits=_subunits(c.get("min_spend", 0)),
-                expires=_date(c.get("expires")),
-                note=c.get("note"),
-            )
-            for c in d.get("card_offers", [])
-        ]
-        earns = [
-            EarnRate(
-                card=e["card"],
-                merchant=e.get("merchant", "*"),
-                rate=float(e["rate"]),
-                kind=e.get("kind", "points"),
-                currency=e.get("currency"),
-            )
-            for e in d.get("earn_rates", [])
-        ]
         return cls(
             point_values_cpp={str(k): float(v) for k, v in (d.get("point_values") or {}).items()},
             portals=portals,
@@ -141,7 +178,9 @@ class OffersBook:
 
         with open(p) as f:
             data = yaml.safe_load(f) or {}
-        return cls.from_dict(data, source=str(p))
+        book = cls.from_dict(data, source=str(p))
+        book.file_mtime = p.stat().st_mtime
+        return book
 
 
 @dataclass
@@ -194,12 +233,12 @@ def compute_effective_price(
 ) -> EffectivePrice:
     """Stack the best portal + all applicable card offers for ``merchant``."""
     on = on or date.today()
-    m = merchant.strip().lower()
+    m = canonical(merchant)
     components: list[dict[str, Any]] = []
     effective = sticker_subunits
 
     # Best portal (only one portal can route a purchase).
-    portal_matches = [p for p in book.portals if p.merchant.strip().lower() == m]
+    portal_matches = [p for p in book.portals if p.merchant == m]
     if portal_matches:
         best = max(
             portal_matches, key=lambda p: p.value_subunits(sticker_subunits, book.point_values_cpp)
@@ -217,7 +256,7 @@ def compute_effective_price(
 
     # Card-linked offers: each distinct card's offer can stack with the portal.
     for c in book.card_offers:
-        if c.merchant.strip().lower() == m and c.applies(sticker_subunits, on):
+        if c.merchant == m and c.applies(sticker_subunits, on):
             components.append(
                 {
                     "kind": "card_offer",
@@ -230,7 +269,7 @@ def compute_effective_price(
 
     # Best earn (merchant-specific beats catch-all only if it values higher).
     earn = None
-    earn_matches = [e for e in book.earn_rates if e.merchant.strip().lower() in (m, "*")]
+    earn_matches = [e for e in book.earn_rates if e.merchant in (m, "*")]
     if earn_matches:
         best_earn = max(
             earn_matches, key=lambda e: e.value_subunits(sticker_subunits, book.point_values_cpp)
@@ -250,6 +289,18 @@ def compute_effective_price(
     if not book.portals and not book.card_offers:
         ep.notes.append(book.source or "offers book empty")
     return ep
+
+
+def _require(d: dict[str, Any], key: str) -> Any:
+    if key not in d or d[key] is None:
+        raise KeyError(f"missing required key '{key}'")
+    return d[key]
+
+
+def _one_of(value: Any, allowed: set[str], key: str) -> str:
+    if value not in allowed:
+        raise ValueError(f"'{key}' must be one of {sorted(allowed)}, got {value!r}")
+    return str(value)
 
 
 def _subunits(v: Any) -> int:

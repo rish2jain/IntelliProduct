@@ -142,6 +142,16 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+# Versioned, ordered migrations (design review §1.8). Each entry migrates a
+# DB *below* that version. Statements must be idempotent-safe against a fresh
+# SCHEMA (OperationalError from an already-applied ALTER is swallowed), since
+# new DBs get the full SCHEMA and then jump straight to SCHEMA_VERSION.
+SCHEMA_VERSION = 1
+MIGRATIONS: dict[int, list[str]] = {
+    1: ["ALTER TABLE tracked_products ADD COLUMN category TEXT"],
+}
+
+
 class Store:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
@@ -150,16 +160,29 @@ class Store:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        # The MCP server (interactive) and the monitor daemon (launchd) share
+        # this file across processes: WAL allows concurrent readers with a
+        # single writer, and busy_timeout retries instead of surfacing
+        # "database is locked" on brief overlaps.
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        if self.db_path != ":memory:":
+            self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.executescript(SCHEMA)
         self._migrate()
         self.conn.commit()
 
     def _migrate(self) -> None:
-        """Additive migrations for DBs created before a column existed."""
-        try:
-            self.conn.execute("ALTER TABLE tracked_products ADD COLUMN category TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already present
+        current = int(self.get_meta("schema_version") or 0)
+        for version in sorted(MIGRATIONS):
+            if version <= current:
+                continue
+            for stmt in MIGRATIONS[version]:
+                try:
+                    self.conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # already applied via a fresh SCHEMA
+        if current < SCHEMA_VERSION:
+            self.set_meta("schema_version", str(SCHEMA_VERSION))
 
     def close(self) -> None:
         self.conn.close()
