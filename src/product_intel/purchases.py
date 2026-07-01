@@ -41,13 +41,16 @@ DEFAULT_POLICY = RetailerPolicy(0, "no known price-protection policy", 30)
 
 
 def policy_for(merchant: str) -> RetailerPolicy:
+    import re
+
     m = canonical(merchant)
     if m in POLICIES:
         return POLICIES[m]
-    # Substring fallback for qualified names the alias table doesn't know
-    # ("amazon uk", "best buy outlet").
+    # Prefix-with-word-boundary fallback for qualified names the alias table
+    # doesn't know ("amazon uk", "best buy outlet") — a plain substring test
+    # would hand Target's policy to "Targeted Deals".
     for key, pol in POLICIES.items():
-        if key in m:
+        if re.match(rf"{re.escape(key)}\b", m):
             return pol
     return DEFAULT_POLICY
 
@@ -152,7 +155,9 @@ def check_purchases(store: Store, now: Optional[float] = None) -> list[Alert]:
         tid = p["tracked_product_id"]
         if tid is None:
             continue
-        latest = store.latest_observation(tid)
+        # Only prices observed AFTER the purchase count: a pre-purchase dip
+        # frozen in history is not a claimable price.
+        latest = store.latest_observation(tid, after=p["purchased_at"])
         if latest and latest.price_subunits < p["price_subunits"]:
             diff = p["price_subunits"] - latest.price_subunits
             msg = (

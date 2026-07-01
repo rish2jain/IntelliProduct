@@ -91,14 +91,19 @@ def test_firmware_pass_checks_open_contradictions():
         "battery drains after 8 months", "reddit:gym_dad",
         "battery life is excellent", "reddit:trail_shooter",
     )
-    alerts = make(s, FakeWebSearchClient()).scan(force=True)
+    scanner = make(s, FakeWebSearchClient())
+    alerts = scanner.scan(force=True)
     fw = [a for a in alerts if a.rule == "firmware_or_recall_signal"]
     assert len(fw) == 1
     assert f"ledger #{cid}" in fw[0].message
-    # Ledger record transitions out of 'open'.
-    assert s.contradictions(open_only=True) == []
-    rec = s.contradictions("Sony a7 IV")[0]
-    assert rec["status"] == "update_reported"
+    # A snippet hit is weak evidence: the record stays OPEN (a human verifies
+    # via resolve_contradiction); the hit is attached as a note.
+    rec = s.contradictions("Sony a7 IV", open_only=True)[0]
+    assert rec["status"] == "open"
+    assert "possible fix reported" in rec["resolution_note"]
+    # Same URL never re-alerts, even across forced re-scans.
+    again = scanner.scan(force=True)
+    assert all(a.rule != "firmware_or_recall_signal" for a in again)
 
 
 def test_no_search_backend_no_crash():

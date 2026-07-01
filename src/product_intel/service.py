@@ -351,6 +351,8 @@ class Service:
         url: Optional[str] = None,
         tracked_id: Optional[int] = None,
     ) -> dict[str, Any]:
+        if tracked_id is not None and self.store.get_tracked(tracked_id) is None:
+            return {"error": f"no tracked product {tracked_id}; omit tracked_id or start_tracking first"}
         return purchases_mod.record_purchase(
             self.store,
             label=label,

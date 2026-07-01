@@ -139,6 +139,13 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- At most one live (open/update_reported) contradiction per (product, aspect),
+-- enforced by the database so concurrent processes (MCP server + monitor)
+-- cannot both insert through a SELECT-then-INSERT race.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_contra_live
+    ON contradictions(product_label, aspect)
+    WHERE status IN ('open', 'update_reported');
 """
 
 
@@ -157,7 +164,11 @@ class Store:
         self.db_path = str(db_path)
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False: FastMCP 3.x runs sync tools on anyio worker
+        # threads, so consecutive tool calls can arrive on different threads.
+        # CPython's sqlite3 is built serialized (threadsafety=3), making the
+        # shared connection safe for this access pattern.
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         # The MCP server (interactive) and the monitor daemon (launchd) share
@@ -179,8 +190,12 @@ class Store:
             for stmt in MIGRATIONS[version]:
                 try:
                     self.conn.execute(stmt)
-                except sqlite3.OperationalError:
-                    pass  # already applied via a fresh SCHEMA
+                except sqlite3.OperationalError as e:
+                    # Only "already applied" is ignorable; a transient failure
+                    # (e.g. a lock) must NOT let the version advance past a
+                    # migration that never ran.
+                    if "duplicate column" not in str(e).lower():
+                        raise
         if current < SCHEMA_VERSION:
             self.set_meta("schema_version", str(SCHEMA_VERSION))
 
@@ -341,12 +356,17 @@ class Store:
         ).fetchall()
         return [_row_to_observation(r) for r in rows]
 
-    def latest_observation(self, tracked_id: int) -> Optional[PriceObservation]:
-        row = self.conn.execute(
-            "SELECT * FROM price_observations WHERE tracked_product_id = ? "
-            "ORDER BY observed_at DESC LIMIT 1",
-            (tracked_id,),
-        ).fetchone()
+    def latest_observation(
+        self, tracked_id: int, after: Optional[float] = None
+    ) -> Optional[PriceObservation]:
+        """Most recent observation, optionally restricted to observed_at > after
+        (price-protection checks must not see pre-purchase prices)."""
+        q = "SELECT * FROM price_observations WHERE tracked_product_id = ?"
+        args: list[float | int] = [tracked_id]
+        if after is not None:
+            q += " AND observed_at > ?"
+            args.append(after)
+        row = self.conn.execute(q + " ORDER BY observed_at DESC LIMIT 1", args).fetchone()
         return _row_to_observation(row) if row else None
 
     # ---- alerts --------------------------------------------------------
@@ -381,23 +401,22 @@ class Store:
         claim_b: str,
         source_b: str,
     ) -> Optional[int]:
-        """Persist a contradiction; dedup on an open record for the same
-        (label, aspect). Returns the new id, or None if already open."""
+        """Persist a contradiction; dedup on a *live* (open or update_reported)
+        record for the same (label, aspect). Returns the new id, or None if one
+        already exists. The unique partial index makes this race-safe across
+        the MCP-server and monitor processes; resolved/dismissed records don't
+        block re-detection on new evidence."""
         from .models import now_ts
 
-        existing = self.conn.execute(
-            "SELECT id FROM contradictions WHERE product_label = ? AND aspect = ? "
-            "AND status = 'open'",
-            (product_label, aspect),
-        ).fetchone()
-        if existing:
+        try:
+            cur = self.conn.execute(
+                """INSERT INTO contradictions
+                   (created_at, product_label, aspect, claim_a, source_a, claim_b, source_b)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (now_ts(), product_label, aspect, claim_a, source_a, claim_b, source_b),
+            )
+        except sqlite3.IntegrityError:
             return None
-        cur = self.conn.execute(
-            """INSERT INTO contradictions
-               (created_at, product_label, aspect, claim_a, source_a, claim_b, source_b)
-               VALUES (?,?,?,?,?,?,?)""",
-            (now_ts(), product_label, aspect, claim_a, source_a, claim_b, source_b),
-        )
         self.conn.commit()
         return int(cur.lastrowid)
 

@@ -138,3 +138,59 @@ migration map, applied idempotently on connect.
 | 1.7 WAL + busy_timeout | `db.Store.__init__` |
 | 1.8 versioned migrations | `db.py` (`SCHEMA_VERSION`, `MIGRATIONS`) |
 | 1.9 hygiene | `workers/discovery.py`, `service.py`, `market.py`; `.github/workflows/tests.yml`, `deploy/mcp.example.json` |
+
+---
+
+## 4. Addendum: adversarial review findings (second pass)
+
+An independent bug-hunting review of the implementation surfaced 16 findings;
+the confirmed and high-value plausible ones were fixed (regression tests in
+`tests/test_review_fixes.py`):
+
+1. **Offers loading could still crash the daemon** — YAML syntax errors,
+   top-level lists, and bad `point_values` escaped the `OffersError` guard.
+   All load failures now surface as `OffersError`.
+2. **Price protection saw pre-purchase prices** — a dip frozen in history
+   before the purchase produced perpetual false claim alerts. Observations
+   now filter to `observed_at > purchased_at`.
+3. **Contradiction dedup loop** — the firmware pass flipping records to
+   `update_reported` let re-synthesis insert duplicates and re-alert forever.
+   Dedup now covers all *live* statuses, enforced by a partial unique index
+   (race-safe across the two processes).
+4. **Weak-evidence status transitions** — a search snippet echoing the query
+   no longer auto-transitions a contradiction; the record stays open with the
+   hit attached as a note, and a human closes it via `resolve_contradiction`.
+5. **Policy substring misfire** — "Targeted Deals" no longer inherits
+   Target's price-adjustment policy (prefix-with-word-boundary matching).
+6. **Layer 1 re-arm lacked hysteresis** — prices oscillating pennies around
+   the target could re-alert every other sweep; re-arm now requires exiting
+   the region by `rearm_fraction`.
+7. **Competitor-move dedup keyed on exact price** — cent-level drift created
+   "new" events every sweep; keys now bucket by whole-percent drop.
+8. **Discontinuation could only ever fire once** — keys now identify the
+   out-of-stock *episode*, so a recovery followed by a real discontinuation
+   re-alerts.
+9. **`"light "` substring matching** — "slight"/"flight" triggered the weight
+   aspect and clause-final "light" was missed; aspect keywords are now
+   word-bounded regexes.
+10. **Decimal numbers split clauses** — "lasts 3.5 hours" severed aspects
+    from their sentiment; the splitter no longer breaks on digit-flanked dots.
+11. **Thread affinity under FastMCP** — sync tools run on worker threads;
+    the SQLite connection now uses `check_same_thread=False` (CPython's
+    sqlite3 is serialized).
+12. **Migration version could advance past a failed migration** — only
+    "duplicate column" errors are swallowed now.
+13. **Card offers over-stacked** — multiple offers (including same-card) all
+    subtracted; one card pays, so only the best applicable offer subtracts,
+    with the alternatives noted.
+14. **Silent 1.0 cpp default** — a miles/points rate whose currency is
+    missing from `point_values` is now a validation error instead of a 37%
+    valuation error.
+15. **`record_purchase` FK crash** — an unknown `tracked_id` now returns an
+    error dict instead of an uncaught `IntegrityError`.
+
+**Accepted risk (documented, not fixed):** cross-process read-modify-write
+races on `last_alert_json` if the MCP server and the monitor run `check_once`
+for the same product in the same instant — worst case one duplicate push
+notification. The fix (per-row optimistic versioning) isn't worth the
+complexity at this duty cycle.

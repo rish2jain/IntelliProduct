@@ -60,13 +60,16 @@ _FUNCTIONS = {
 _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*\+?\s*(year|month|week)s?", re.IGNORECASE)
 _DURATION_FACTOR = {"year": 12.0, "month": 1.0, "week": 0.25}
 
+# Aspect keyword patterns. Word-bounded so "slight"/"flight" don't trigger
+# "light", with open right boundaries only where inflection is wanted
+# ("overheat" covers overheats/overheating).
 ASPECTS = {
-    "battery": ["battery"],
-    "autofocus": ["autofocus", "af tracking", "focus tracking"],
-    "overheating": ["overheat"],
-    "build": ["build quality", "weather seal"],
-    "screen": ["screen", "evf", "viewfinder"],
-    "weight": ["weight", "heavy", "light "],
+    "battery": r"\bbattery\b",
+    "autofocus": r"\bautofocus\b|\baf tracking\b|\bfocus tracking\b",
+    "overheating": r"\boverheat",
+    "build": r"\bbuild quality\b|\bweather seal",
+    "screen": r"\bscreen\b|\bevf\b|\bviewfinder\b",
+    "weight": r"\bweight\b|\bheavy\b|\blight\b",
 }
 _POS = [
     "great", "excellent", "amazing", "love", "fast", "reliable", "sharp",
@@ -105,12 +108,17 @@ class HeuristicLLM(LocalLLM):
         # Clause-level scoring: split on sentence ends and contrastive "but"
         # so "autofocus is great, but the battery drains" yields one claim per
         # aspect instead of the sentiments cancelling across the sentence.
-        clauses = re.split(r"[.;!?]|\bbut\b", doc.text, flags=re.IGNORECASE)
+        # A '.' flanked by digits is a decimal ("3.5 hours"), not a boundary.
+        clauses = re.split(
+            r"[;!?]|\bbut\b|(?<!\d)\.|\.(?!\d)", doc.text, flags=re.IGNORECASE
+        )
         claims: list[Claim] = []
-        for aspect, keys in ASPECTS.items():
+        for aspect, pattern in ASPECTS.items():
             for clause in clauses:
+                if clause is None:
+                    continue
                 low = clause.lower()
-                if not any(k in low for k in keys):
+                if not re.search(pattern, low):
                     continue
                 # Positive words match exactly ("fast", not "faster"); negative
                 # stems match prefixes ("drain" covers "drains", "drained").

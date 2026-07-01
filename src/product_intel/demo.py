@@ -29,7 +29,7 @@ def main() -> None:
     # Phase B offer book (normally ~/.product-intel/offers.yaml).
     service.offers = OffersBook.from_dict(
         {
-            "point_values": {"AA": 1.6},
+            "point_values": {"AA": 1.6, "C1": 1.8},
             "portals": [{"portal": "Rakuten", "merchant": "B&H", "rate": 4.0, "kind": "cash"}],
             "card_offers": [
                 {"card": "Amex Plat", "merchant": "B&H", "discount": 64.0,

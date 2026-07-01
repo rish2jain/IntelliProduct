@@ -62,9 +62,11 @@ def evaluate(
     # Dedup-by-improvement alone would eat mid-cycle events: alert at $2,279,
     # rebound to $2,450 for two months, drop to $2,299 — no alert, because
     # $2,299 doesn't beat $2,279. Exiting the trigger region resets the layer,
-    # so re-entering it is a new event. The caller must persist the returned
-    # dedup state even when no alerts fire.
-    if price > tracked.target_price_subunits:
+    # so re-entering it is a new event. Both layers re-arm with a hysteresis
+    # band (rearm_fraction) so dynamic pricing oscillating pennies around the
+    # boundary doesn't re-alert every other sweep. The caller must persist the
+    # returned dedup state even when no alerts fire.
+    if price > tracked.target_price_subunits * (1 + params.rearm_fraction):
         last_alert.pop(AlertLayer.THRESHOLD.value, None)
     l2_prev = last_alert.get(AlertLayer.RELATIVE_VALUE.value)
     if l2_prev is not None and price >= l2_prev * (1 + params.rearm_fraction):

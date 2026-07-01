@@ -72,12 +72,21 @@ class MarketScanner:
             if len(obs) < 2:
                 continue
             if obs[-1].availability in gone and any(o.availability == Availability.IN_STOCK for o in obs[:-1]):
+                # Key on the start of the current out-of-stock run, so a
+                # product that recovers and later disappears again is a new
+                # episode — not swallowed by a once-ever ledger entry.
+                flip_at = obs[-1].observed_at
+                for o in reversed(obs[:-1]):
+                    if o.availability not in gone:
+                        break
+                    flip_at = o.observed_at
                 msg = (
                     f"{t.label}: availability flipped to {obs[-1].availability.value} at "
                     f"{t.merchant} after being in stock — possible discontinuation or "
                     f"supply gap; check other retailers"
                 )
-                if self._store.try_add_event(f"disc:{t.id}", "discontinuation_signal", msg, t.id):
+                key = f"disc:{t.id}:{int(flip_at)}"
+                if self._store.try_add_event(key, "discontinuation_signal", msg, t.id):
                     alerts.append(_l3(t, "discontinuation_signal", msg, obs[-1].price_subunits))
         return alerts
 
@@ -102,13 +111,16 @@ class MarketScanner:
                     latest = obs[-1].price_subunits
                     median = statistics.median(o.price_subunits for o in obs[:-1])
                     if latest <= median * (1 - self._params.competitor_drop_fraction):
+                        drop_pct = round((1 - latest / median) * 100)
                         msg = (
                             f"{t.label}: competitor move in '{category}' — {other.label} "
                             f"dropped to ${latest / 100:,.2f} "
-                            f"({(1 - latest / median) * 100:.0f}% under its trailing median) "
-                            f"at {other.merchant}"
+                            f"({drop_pct}% under its trailing median) at {other.merchant}"
                         )
-                        key = f"comp:{t.id}:{other.id}:{latest}"
+                        # Bucket the dedup key by whole-percent drop: cent-level
+                        # drift below the median is the same event; each further
+                        # full percent of drop is a new one.
+                        key = f"comp:{t.id}:{other.id}:{drop_pct}"
                         if self._store.try_add_event(key, "competitor_price_move", msg, t.id):
                             alerts.append(_l3(t, "competitor_price_move", msg, latest))
         return alerts
@@ -133,7 +145,14 @@ class MarketScanner:
         return alerts
 
     def _firmware_pass(self, tracked: list[TrackedProduct]) -> list[Alert]:
-        """Check firmware/recall news against open contradiction records."""
+        """Check firmware/recall news against open contradiction records.
+
+        A search snippet that merely echoes the query is weak evidence: the
+        record stays *open* (a human verifies and calls resolve_contradiction);
+        the hit is attached as a note. Event dedup keys on (label, aspect, url)
+        rather than the ledger id, so the same URL never re-alerts even if the
+        record is later recreated.
+        """
         if self._search is None:
             return []
         alerts = []
@@ -149,11 +168,12 @@ class MarketScanner:
                     msg = (
                         f"{t.label}: manufacturer may have addressed the open "
                         f"'{c['aspect']}' contradiction (ledger #{c['id']}) — "
-                        f"\"{h['title']}\" ({h['url']})"
+                        f"\"{h['title']}\" ({h['url']}). Verify, then resolve_contradiction."
                     )
-                    if self._store.try_add_event(f"fw:{c['id']}:{h['url']}", "firmware_signal", msg, t.id):
+                    key = f"fw:{c['product_label']}:{c['aspect']}:{h['url']}"
+                    if self._store.try_add_event(key, "firmware_signal", msg, t.id):
                         self._store.set_contradiction_status(
-                            int(c["id"]), "update_reported", note=h["url"]
+                            int(c["id"]), "open", note=f"possible fix reported: {h['url']}"
                         )
                         alerts.append(_l3(t, "firmware_or_recall_signal", msg, 0, deep_link=h["url"]))
                     break

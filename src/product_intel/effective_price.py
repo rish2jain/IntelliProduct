@@ -110,7 +110,17 @@ class OffersBook:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], source: Optional[str] = None) -> "OffersBook":
+        if not isinstance(d, dict):
+            raise OffersError(
+                f"offers YAML invalid: top level must be a mapping, got {type(d).__name__}"
+            )
         errors: list[str] = []
+        point_values: dict[str, float] = {}
+        for k, v in (d.get("point_values") or {}).items():
+            try:
+                point_values[str(k)] = float(v)
+            except (ValueError, TypeError):
+                errors.append(f"point_values[{k!r}]: not a number ({v!r})")
         portals: list[PortalOffer] = []
         for i, p in enumerate(d.get("portals") or []):
             try:
@@ -156,12 +166,24 @@ class OffersBook:
                 )
             except (KeyError, ValueError, TypeError) as err:
                 errors.append(f"earn_rates[{i}]: {err}")
+        # Cross-reference: every miles/points rate must have a valuation, or
+        # its value silently defaults to 1.0 cpp and can misrank portals.
+        for i, p in enumerate(portals):
+            if p.kind == "miles" and (p.currency or "") not in point_values:
+                errors.append(
+                    f"portals[{i}]: currency {p.currency!r} has no entry in point_values"
+                )
+        for i, e in enumerate(earns):
+            if e.kind == "points" and (e.currency or "") not in point_values:
+                errors.append(
+                    f"earn_rates[{i}]: currency {e.currency!r} has no entry in point_values"
+                )
         if errors:
             raise OffersError(
                 "offers YAML invalid:\n  " + "\n  ".join(errors)
             )
         return cls(
-            point_values_cpp={str(k): float(v) for k, v in (d.get("point_values") or {}).items()},
+            point_values_cpp=point_values,
             portals=portals,
             card_offers=cards,
             earn_rates=earns,
@@ -176,8 +198,13 @@ class OffersBook:
             return cls(source=f"{p} (not found — effective price == sticker price)")
         import yaml
 
-        with open(p) as f:
-            data = yaml.safe_load(f) or {}
+        try:
+            with open(p) as f:
+                data = yaml.safe_load(f) or {}
+        except (yaml.YAMLError, OSError) as e:
+            # Hand-edited weekly: a stray tab must surface as the same
+            # recoverable error class as a bad entry, not crash the daemon.
+            raise OffersError(f"offers YAML unreadable: {e}") from e
         book = cls.from_dict(data, source=str(p))
         book.file_mtime = p.stat().st_mtime
         return book
@@ -254,18 +281,32 @@ def compute_effective_price(
             )
             effective -= value
 
-    # Card-linked offers: each distinct card's offer can stack with the portal.
-    for c in book.card_offers:
-        if c.merchant == m and c.applies(sticker_subunits, on):
-            components.append(
-                {
-                    "kind": "card_offer",
-                    "label": f"{c.card} offer",
-                    "value_subunits": c.discount_subunits,
-                    "expires": c.expires.isoformat() if c.expires else None,
-                }
+    # Card-linked offers stack with the portal, but a purchase is paid with
+    # ONE card — only the single best applicable offer subtracts. Others are
+    # noted as alternatives so a different-card routing stays visible.
+    applicable = [c for c in book.card_offers if c.merchant == m and c.applies(sticker_subunits, on)]
+    if applicable:
+        best_offer = max(applicable, key=lambda c: c.discount_subunits)
+        components.append(
+            {
+                "kind": "card_offer",
+                "label": f"{best_offer.card} offer",
+                "value_subunits": best_offer.discount_subunits,
+                "expires": best_offer.expires.isoformat() if best_offer.expires else None,
+            }
+        )
+        effective -= best_offer.discount_subunits
+        alternatives = [c for c in applicable if c is not best_offer]
+        if alternatives:
+            notes_alt = ", ".join(
+                f"{c.card} ${c.discount_subunits / 100:,.2f}" for c in alternatives
             )
-            effective -= c.discount_subunits
+            # Collected into ep.notes after construction below.
+            alt_note = f"other card offers not stacked (one card pays): {notes_alt}"
+        else:
+            alt_note = None
+    else:
+        alt_note = None
 
     # Best earn (merchant-specific beats catch-all only if it values higher).
     earn = None
@@ -286,6 +327,8 @@ def compute_effective_price(
         components=components,
         earn=earn,
     )
+    if alt_note:
+        ep.notes.append(alt_note)
     if not book.portals and not book.card_offers:
         ep.notes.append(book.source or "offers book empty")
     return ep
